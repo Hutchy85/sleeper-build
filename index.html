@@ -199,6 +199,75 @@
       }
     ];
 
+    // --- SMALL UTILITIES ---
+    const dayKey = (d = new Date()) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+    const roundTo = (x, step) => Math.round(x / step) * step;
+
+    // --- PHOTO STORAGE (IndexedDB, on-device only) ---
+    const openPhotoDB = () => new Promise((resolve, reject) => {
+      const req = indexedDB.open('sleeper_photos_db', 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('photos', { keyPath: 'id' });
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    const dbGetAllPhotos = async () => {
+      const db = await openPhotoDB();
+      return new Promise((resolve, reject) => {
+        const r = db.transaction('photos', 'readonly').objectStore('photos').getAll();
+        r.onsuccess = () => resolve(r.result);
+        r.onerror = () => reject(r.error);
+      });
+    };
+    const dbPutPhoto = async (photo) => {
+      const db = await openPhotoDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('photos', 'readwrite');
+        tx.objectStore('photos').put(photo);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    };
+    const dbDeletePhoto = async (id) => {
+      const db = await openPhotoDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('photos', 'readwrite');
+        tx.objectStore('photos').delete(id);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    };
+    // Shrink to max 1000px and JPEG-compress so photos stay small
+    const compressImage = (file) => new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, 1000 / Math.max(img.width, img.height));
+        const c = document.createElement('canvas');
+        c.width = Math.round(img.width * scale);
+        c.height = Math.round(img.height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        resolve(c.toDataURL('image/jpeg', 0.8));
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('That image could not be read')); };
+      img.src = url;
+    });
+
+    // --- WARM-UP SETS (big barbell lifts only, assumes a 20kg bar) ---
+    const makeWarmups = (name, workingWeight) => {
+      if (!/squat|bench press|deadlift|overhead press/i.test(name)) return [];
+      const W = Number(workingWeight) || 0;
+      if (W <= 20) return [];
+      const list = [{ weight: 20, reps: 8 }];
+      [[0.5, 5], [0.7, 3], [0.85, 1]].forEach(([pct, reps]) => {
+        const w = roundTo(W * pct, 2.5);
+        if (w > 20 && w < W && !list.some(x => x.weight === w)) list.push({ weight: w, reps });
+      });
+      return list;
+    };
+
     // --- PROGRESSION HELPERS ---
     // Double progression: hit the TOP of the rep range on every set with 2+ reps in reserve, then add weight.
     const parseRepRange = (str) => {
@@ -213,14 +282,15 @@
       return 2.5;
     };
 
-    // logs are stored newest-first
-    const getSuggestion = (logs, ex) => {
+    // logs are stored newest-first; deload sessions are ignored so you resume from your real working weights
+    const getBaseSuggestion = (logs, ex) => {
       let prev = null;
       for (const log of logs) {
+        if (log.deload) continue;
         const found = (log.exercises || []).find(e => e.name === ex.name && e.sets.some(s => s.completed));
         if (found) { prev = found; break; }
       }
-      if (!prev) return { weight: ex.defaultWeight, note: 'First time: starting weight' };
+      if (!prev) return { weight: ex.defaultWeight, last: ex.defaultWeight, note: 'First time: starting weight' };
 
       const done = prev.sets.filter(s => s.completed);
       const topWeight = Math.max(...done.map(s => Number(s.weight)));
@@ -228,7 +298,7 @@
       const range = parseRepRange(ex.reps);
 
       if (topWeight === 0 && ex.defaultWeight === 0) {
-        return { weight: 0, note: `Last: ${repsText} reps. Try to beat one set by a rep.` };
+        return { weight: 0, last: 0, note: `Last: ${repsText} reps. Try to beat one set by a rep.` };
       }
 
       const atTop = done.filter(s => Number(s.weight) === topWeight);
@@ -240,12 +310,19 @@
 
       if (allSetsDone && allTopReps && allEasyEnough) {
         const inc = getIncrement(ex.name);
-        return { weight: Math.round((topWeight + inc) * 100) / 100, note: `${lastText}. Every set hit the top of the range: +${inc}kg today.` };
+        return { weight: Math.round((topWeight + inc) * 100) / 100, last: topWeight, note: `${lastText}. Every set hit the top of the range: +${inc}kg today.` };
       }
       if (anyBelowMin) {
-        return { weight: topWeight, note: `${lastText}. Hold this weight and aim for ${range.min}+ reps on every set.` };
+        return { weight: topWeight, last: topWeight, note: `${lastText}. Hold this weight and aim for ${range.min}+ reps on every set.` };
       }
-      return { weight: topWeight, note: `${lastText}. Same weight: aim for ${range.max} reps on every set with 2+ RIR.` };
+      return { weight: topWeight, last: topWeight, note: `${lastText}. Same weight: aim for ${range.max} reps on every set with 2+ RIR.` };
+    };
+
+    const getSuggestion = (logs, ex, deload = false) => {
+      const base = getBaseSuggestion(logs, ex);
+      if (!deload) return base;
+      const w = base.last > 0 ? roundTo(base.last * 0.9, 2.5) : 0;
+      return { weight: w, note: w > 0 ? `Deload: about 90% of ${base.last}kg. Stop every set with 3+ reps left.` : 'Deload: easy sets, stop with 3+ reps left.' };
     };
 
     // --- MAIN APP COMPONENT ---
@@ -255,10 +332,18 @@
       const [currentPhase, setCurrentPhase] = useState('phase1'); // phase1 or phase2
       const [selectedWorkout, setSelectedWorkout] = useState('A'); // A or B
       const [currentWeek, setCurrentWeek] = useState(1);
-      const [proteinIntake, setProteinIntake] = useState(0);
-      const [proteinGoal, setProteinGoal] = useState(150); // Mid-range of 140g-160g
+      const [proteinEntries, setProteinEntries] = useState([]); // today's individual entries
+      const [proteinHistory, setProteinHistory] = useState({}); // { 'YYYY-MM-DD': grams }
+      const [customProtein, setCustomProtein] = useState('');
+      const proteinIntake = proteinEntries.reduce((a, b) => a + b, 0);
       const [checkIns, setCheckIns] = useState([]); // newest first
       const [ciForm, setCiForm] = useState({ weight: '', waist: '', chest: '', arm: '', thigh: '' });
+      const proteinGoal = checkIns[0] ? Math.round((checkIns[0].weight * 1.8) / 5) * 5 : 150; // ~1.8g per kg
+      const [deloadChoice, setDeloadChoice] = useState({}); // { weekNumber: true/false }
+      const [photos, setPhotos] = useState([]);
+      const [photoLabel, setPhotoLabel] = useState('Front');
+      const [photosShown, setPhotosShown] = useState(false);
+      const [viewPhoto, setViewPhoto] = useState(null);
       const [workoutLogs, setWorkoutLogs] = useState([]);
       const [maxLifts, setMaxLifts] = useState({
         bench: 40,
@@ -276,22 +361,50 @@
       const [isTimerRunning, setIsTimerRunning] = useState(false);
       const timerRef = useRef(null);
 
+      // --- DELOAD LOGIC ---
+      const isScheduledDeload = currentWeek % 6 === 0;
+      const deloadActive = deloadChoice[currentWeek] !== undefined ? deloadChoice[currentWeek] : isScheduledDeload;
+      const toggleDeload = () => setDeloadChoice({ ...deloadChoice, [currentWeek]: !deloadActive });
+      const recentLogs = workoutLogs.filter(l => !l.deload).slice(0, 2);
+      const recentSets = recentLogs.flatMap(l => l.exercises.flatMap(e => e.sets.filter(st => st.completed)));
+      const needsDeload = !deloadActive && recentLogs.length >= 2 && recentSets.length >= 8 &&
+        recentSets.filter(st => Number(st.rir) === 0).length / recentSets.length >= 0.5;
+
       // Load Data from LocalStorage on mount
       useEffect(() => {
         const savedLogs = localStorage.getItem('sleeper_workout_logs');
         if (savedLogs) setWorkoutLogs(JSON.parse(savedLogs));
 
-        const savedProtein = localStorage.getItem('sleeper_protein_today');
-        const savedProteinDate = localStorage.getItem('sleeper_protein_date');
         const todayStr = new Date().toDateString();
+        let hist = {};
+        let entries = [];
+        try { hist = JSON.parse(localStorage.getItem('sleeper_protein_history') || '{}'); } catch (e) {}
+        try { entries = JSON.parse(localStorage.getItem('sleeper_protein_entries') || '[]'); } catch (e) {}
+        const savedProtein = Number(localStorage.getItem('sleeper_protein_today') || 0);
+        const savedProteinDate = localStorage.getItem('sleeper_protein_date');
 
-        if (savedProteinDate === todayStr && savedProtein) {
-          setProteinIntake(Number(savedProtein));
+        if (savedProteinDate === todayStr) {
+          if (entries.length === 0 && savedProtein > 0) entries = [savedProtein]; // carried over from an older version
+          setProteinEntries(entries);
         } else {
-          localStorage.setItem('sleeper_protein_date', todayStr);
-          localStorage.setItem('sleeper_protein_today', '0');
-          setProteinIntake(0);
+          // new day: bank the last day's total into history, start fresh
+          const prevTotal = entries.length ? entries.reduce((a, b) => a + b, 0) : savedProtein;
+          if (savedProteinDate && prevTotal > 0) {
+            const d = new Date(savedProteinDate);
+            if (!isNaN(d.getTime())) hist[dayKey(d)] = prevTotal;
+          }
+          setProteinEntries([]);
         }
+        setProteinHistory(hist);
+
+        try {
+          const savedDeload = localStorage.getItem('sleeper_deload_choice');
+          if (savedDeload) setDeloadChoice(JSON.parse(savedDeload));
+        } catch (e) {}
+
+        dbGetAllPhotos()
+          .then(list => setPhotos(list.sort((x, y) => y.id - x.id)))
+          .catch(() => {});
 
         const savedMaxes = localStorage.getItem('sleeper_max_lifts');
         if (savedMaxes) setMaxLifts(JSON.parse(savedMaxes));
@@ -312,8 +425,17 @@
 
       useEffect(() => {
         localStorage.setItem('sleeper_protein_today', proteinIntake.toString());
+        localStorage.setItem('sleeper_protein_entries', JSON.stringify(proteinEntries));
         localStorage.setItem('sleeper_protein_date', new Date().toDateString());
-      }, [proteinIntake]);
+      }, [proteinEntries]);
+
+      useEffect(() => {
+        localStorage.setItem('sleeper_protein_history', JSON.stringify(proteinHistory));
+      }, [proteinHistory]);
+
+      useEffect(() => {
+        localStorage.setItem('sleeper_deload_choice', JSON.stringify(deloadChoice));
+      }, [deloadChoice]);
 
       useEffect(() => {
         localStorage.setItem('sleeper_max_lifts', JSON.stringify(maxLifts));
@@ -357,15 +479,17 @@
       const handleStartWorkout = () => {
         const program = WORKOUT_PROGRAMS[currentPhase].workouts[selectedWorkout];
         const initialData = program.exercises.map(ex => {
-          const sug = getSuggestion(workoutLogs, ex);
+          const sug = getSuggestion(workoutLogs, ex, deloadActive);
+          const setCount = deloadActive ? Math.max(2, Math.ceil(ex.sets / 2)) : ex.sets;
           return {
             name: ex.name,
             note: sug.note,
-            sets: Array.from({ length: ex.sets }, (_, i) => ({
+            warmupDone: {},
+            sets: Array.from({ length: setCount }, (_, i) => ({
               setNum: i + 1,
               weight: sug.weight,
               reps: parseInt(ex.reps) || 5,
-              rir: 2,
+              rir: deloadActive ? 3 : 2,
               completed: false
             }))
           };
@@ -378,6 +502,14 @@
       const handleUpdateSet = (exIdx, setIdx, field, value) => {
         const updated = [...activeSessionData];
         updated[exIdx].sets[setIdx][field] = value;
+        setActiveSessionData(updated);
+      };
+
+      const toggleWarmup = (exIdx, wIdx) => {
+        const updated = activeSessionData.map((ex, i) => i !== exIdx ? ex : {
+          ...ex,
+          warmupDone: { ...(ex.warmupDone || {}), [wIdx]: !(ex.warmupDone && ex.warmupDone[wIdx]) }
+        });
         setActiveSessionData(updated);
       };
 
@@ -421,6 +553,7 @@
           workout: selectedWorkout,
           name: WORKOUT_PROGRAMS[currentPhase].workouts[selectedWorkout].name,
           exercises: activeSessionData,
+          deload: deloadActive,
           totalVolume: totalVol
         };
 
@@ -432,7 +565,42 @@
 
       // Add Quick Protein
       const addProtein = (grams) => {
-        setProteinIntake(prev => Math.min(prev + grams, 300));
+        const g = Math.round(Number(grams));
+        if (!g || g < 1 || g > 200) return;
+        setProteinEntries(prev => [...prev, g]);
+      };
+      const undoProtein = () => setProteinEntries(prev => prev.slice(0, -1));
+      const addCustomProtein = () => {
+        addProtein(customProtein);
+        setCustomProtein('');
+      };
+
+      // --- PROGRESS PHOTOS ---
+      const handlePhotoPick = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        e.target.value = '';
+        if (!file) return;
+        try {
+          const data = await compressImage(file);
+          const photo = { id: Date.now(), iso: new Date().toISOString(), label: photoLabel, data };
+          await dbPutPhoto(photo);
+          setPhotos(prev => [photo, ...prev]);
+          setPhotosShown(true);
+          if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+        } catch (err) {
+          alert('Could not save that photo: ' + (err && err.message ? err.message : err));
+        }
+      };
+
+      const handleDeletePhoto = async (id) => {
+        if (!confirm("Delete this photo? It can't be recovered.")) return;
+        try {
+          await dbDeletePhoto(id);
+          setPhotos(prev => prev.filter(ph => ph.id !== id));
+          setViewPhoto(null);
+        } catch (err) {
+          alert('Could not delete that photo.');
+        }
       };
 
       // Export Log History as CSV
@@ -578,6 +746,20 @@
             </div>
           )}
 
+          {/* FULL-SIZE PHOTO VIEWER */}
+          {viewPhoto && (
+            <div className="fixed inset-0 bg-black/90 z-50 flex flex-col items-center justify-center p-4 gap-3">
+              <img src={viewPhoto.data} alt="Progress photo" className="max-h-[75vh] max-w-full object-contain rounded-lg" />
+              <p className="text-xs text-slate-300">
+                {viewPhoto.label} · {new Date(viewPhoto.iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+              </p>
+              <div className="flex gap-3">
+                <button onClick={() => setViewPhoto(null)} className="px-4 py-2 bg-slate-800 border border-slate-700 text-white text-sm font-bold rounded-lg">Close</button>
+                <button onClick={() => handleDeletePhoto(viewPhoto.id)} className="px-4 py-2 bg-red-900/60 border border-red-700 text-red-200 text-sm font-bold rounded-lg">Delete</button>
+              </div>
+            </div>
+          )}
+
           {/* MAIN NAVIGATION TABS */}
           <nav className="flex bg-slate-900 p-1 rounded-xl mb-6 border border-slate-800 text-xs md:text-sm font-medium overflow-x-auto">
             {[
@@ -667,6 +849,29 @@
                   })}
                 </div>
               </div>
+
+              {/* DELOAD BANNER */}
+              {(deloadActive || needsDeload || isScheduledDeload) && (
+                <div className={`p-4 rounded-xl border ${deloadActive ? 'border-amber-500/40 bg-amber-500/10' : 'border-blue-500/30 bg-blue-500/10'}`}>
+                  <p className="text-sm font-bold text-white">
+                    {deloadActive ? `Deload week (week ${currentWeek})` : needsDeload ? 'Deload suggested' : 'Deload skipped this week'}
+                  </p>
+                  <p className="text-xs text-slate-300 mt-1">
+                    {deloadActive
+                      ? 'Half the sets, about 90% of your last working weights, and stop every set with 3+ reps left. Next week you carry on from your pre-deload weights.'
+                      : needsDeload
+                        ? 'Most of your recent sets were taken to failure. A lighter week now usually means stronger lifts afterwards.'
+                        : 'You skipped this scheduled deload. You can switch it back on any time.'}
+                  </p>
+                  <p className="text-xs text-slate-500 mt-1">Scheduled automatically every 6th week.</p>
+                  <button
+                    onClick={toggleDeload}
+                    className="mt-2 px-3 py-1.5 text-xs font-bold rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  >
+                    {deloadActive ? 'Skip deload this week' : 'Make this a deload week'}
+                  </button>
+                </div>
+              )}
 
               {/* QUICK LAUNCH WORKOUT BUTTON */}
               <div className="glass-card p-6 rounded-2xl border border-blue-500/30 bg-gradient-to-br from-slate-900 to-blue-950/40">
@@ -784,7 +989,7 @@
                 <div className="space-y-6">
                   <div className="glass-card p-4 rounded-xl flex items-center justify-between">
                     <div>
-                      <span className="text-xs text-blue-400 font-bold uppercase tracking-wider">Live Gym Session</span>
+                      <span className="text-xs text-blue-400 font-bold uppercase tracking-wider">Live Gym Session{deloadActive ? ' · Deload' : ''}</span>
                       <h2 className="text-lg font-bold text-white">{WORKOUT_PROGRAMS[currentPhase].workouts[selectedWorkout].name}</h2>
                     </div>
                     <button
@@ -806,6 +1011,28 @@
                               <h3 className="font-bold text-white text-sm">{ex.name}</h3>
                               <p className="text-xs text-slate-400">Target: {progEx.sets} sets × {progEx.reps} reps ({progEx.rest}s rest)</p>
                               {ex.note && <p className="text-xs text-blue-300 mt-0.5">{ex.note}</p>}
+                              {(() => {
+                                const wu = makeWarmups(ex.name, ex.sets[0] ? ex.sets[0].weight : 0);
+                                if (wu.length === 0) return null;
+                                return (
+                                  <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                                    <span className="text-xs text-slate-500 font-semibold">Warm-up (kg×reps):</span>
+                                    {wu.map((w, wIdx) => (
+                                      <button
+                                        key={wIdx}
+                                        onClick={() => toggleWarmup(exIdx, wIdx)}
+                                        className={`text-xs font-mono px-2 py-1 rounded border ${
+                                          ex.warmupDone && ex.warmupDone[wIdx]
+                                            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300 line-through'
+                                            : 'bg-slate-900 border-slate-700 text-slate-300'
+                                        }`}
+                                      >
+                                        {w.weight}×{w.reps}
+                                      </button>
+                                    ))}
+                                  </div>
+                                );
+                              })()}
                             </div>
                             <button
                               onClick={() => startRestTimer(progEx.rest)}
@@ -897,9 +1124,9 @@
           {activeTab === 'protein' && (
             <div className="space-y-6">
               <div className="glass-card p-6 rounded-2xl text-center space-y-4">
-                <h2 className="text-xl font-bold text-white">Daily Protein Goal (140g–160g)</h2>
+                <h2 className="text-xl font-bold text-white">Daily Protein Goal ({proteinGoal}g)</h2>
                 <p className="text-xs text-slate-400 max-w-md mx-auto">
-                  To build dense muscle without getting bulky, aim for ~1.8g protein per kg of body weight (approx. 145g for an 80kg lifter).
+                  To build dense muscle without getting bulky, aim for ~1.8g protein per kg of body weight{latestCheckIn ? ` (${latestCheckIn.weight.toFixed(1)}kg gives ${proteinGoal}g).` : '. Log a weekly check-in and this goal personalises itself.'}
                 </p>
 
                 {/* CIRCULAR PROGRESS DISPLAY */}
@@ -927,10 +1154,17 @@
 
                 <div className="flex justify-center gap-2">
                   <button 
-                    onClick={() => setProteinIntake(0)}
+                    onClick={() => setProteinEntries([])}
                     className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-xs text-slate-400 rounded"
                   >
                     Reset Today
+                  </button>
+                  <button
+                    onClick={undoProtein}
+                    disabled={proteinEntries.length === 0}
+                    className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 rounded disabled:opacity-40"
+                  >
+                    {proteinEntries.length > 0 ? `Undo last (+${proteinEntries[proteinEntries.length - 1]}g)` : 'Undo last'}
                   </button>
                 </div>
               </div>
@@ -938,6 +1172,22 @@
               {/* QUICK ADD BUTTONS */}
               <div className="glass-card p-5 rounded-2xl space-y-3">
                 <h3 className="text-sm font-bold text-white uppercase tracking-wider">Quick Add Protein</h3>
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    placeholder="Custom grams"
+                    value={customProtein}
+                    onChange={(e) => setCustomProtein(e.target.value)}
+                    className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    onClick={addCustomProtein}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-bold rounded-lg"
+                  >
+                    Add
+                  </button>
+                </div>
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                   {[
                     { label: '+25g Whey Shake', amount: 25, icon: '🥛' },
@@ -956,6 +1206,56 @@
                   ))}
                 </div>
               </div>
+
+              {/* LAST 7 DAYS */}
+              {(() => {
+                const days = [];
+                for (let i = 6; i >= 0; i--) {
+                  const d = new Date();
+                  d.setDate(d.getDate() - i);
+                  days.push({
+                    label: d.toLocaleDateString('en-GB', { weekday: 'short' }).slice(0, 2),
+                    g: i === 0 ? proteinIntake : (proteinHistory[dayKey(d)] || 0),
+                    today: i === 0
+                  });
+                }
+                const top = Math.max(proteinGoal, ...days.map(x => x.g)) * 1.1;
+                const logged = days.filter(x => x.g > 0);
+                const avg = logged.length ? Math.round(logged.reduce((a, x) => a + x.g, 0) / logged.length) : 0;
+                return (
+                  <div className="glass-card p-5 rounded-2xl space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-bold text-white uppercase tracking-wider">Last 7 Days</h3>
+                      <span className="text-xs text-slate-400">{logged.length > 0 ? `Average ${avg}g on logged days` : 'Nothing logged yet'}</span>
+                    </div>
+                    <div className="relative h-28">
+                      <div
+                        className="absolute left-0 right-0 border-t border-dashed border-emerald-500/60"
+                        style={{ bottom: `${(proteinGoal / top) * 100}%` }}
+                      ></div>
+                      <div className="absolute inset-0 flex items-end gap-2">
+                        {days.map((d, i) => (
+                          <div key={i} className="flex-1 flex flex-col items-center justify-end h-full">
+                            <div
+                              className={`w-full rounded-t ${d.today ? 'bg-blue-500' : d.g >= proteinGoal * 0.9 ? 'bg-emerald-500' : 'bg-slate-600'}`}
+                              style={{ height: `${(d.g / top) * 100}%` }}
+                            ></div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      {days.map((d, i) => (
+                        <div key={i} className="flex-1 text-center">
+                          <p className="text-xs text-slate-400">{d.label}</p>
+                          <p className="text-xs text-slate-500 font-mono">{d.g || '-'}</p>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-xs text-slate-500">Dashed line is your goal. Green days reached at least 90% of it.</p>
+                  </div>
+                );
+              })()}
 
               {/* MEAL CHEAT SHEET */}
               <div className="glass-card p-5 rounded-2xl space-y-3">
@@ -1079,6 +1379,74 @@
                 )}
               </div>
 
+              {/* PROGRESS PHOTOS */}
+              <div className="glass-card p-5 rounded-2xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-base font-bold text-white">Progress Photos</h3>
+                  {photos.length > 0 && (
+                    <button
+                      onClick={() => setPhotosShown(!photosShown)}
+                      className="text-xs px-2.5 py-1 bg-slate-800 border border-slate-700 rounded text-slate-300"
+                    >
+                      {photosShown ? 'Hide photos' : `Show photos (${photos.length})`}
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-slate-400">
+                  Saved only on this phone, never uploaded. Same spot, same light, same pose every 4 weeks works best. Clearing your browser or app data deletes them.
+                </p>
+                <div className="flex gap-2 items-center">
+                  <select
+                    value={photoLabel}
+                    onChange={(e) => setPhotoLabel(e.target.value)}
+                    className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-white"
+                  >
+                    <option>Front</option>
+                    <option>Side</option>
+                    <option>Back</option>
+                  </select>
+                  <label className="flex-1 text-center py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm rounded-xl cursor-pointer">
+                    Add {photoLabel.toLowerCase()} photo
+                    <input type="file" accept="image/*" className="hidden" onChange={handlePhotoPick} />
+                  </label>
+                </div>
+
+                {photosShown && (() => {
+                  const shown = photos.filter(ph => ph.label === photoLabel);
+                  const fmt = (iso) => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+                  if (shown.length === 0) {
+                    return <p className="text-xs text-slate-500">No {photoLabel.toLowerCase()} photos yet.</p>;
+                  }
+                  const first = shown[shown.length - 1];
+                  const latest = shown[0];
+                  return (
+                    <div className="space-y-3">
+                      {shown.length >= 2 && (
+                        <div>
+                          <p className="text-xs text-slate-400 font-semibold mb-1">First vs latest ({photoLabel.toLowerCase()})</p>
+                          <div className="grid grid-cols-2 gap-2">
+                            {[first, latest].map((ph, i) => (
+                              <button key={ph.id} onClick={() => setViewPhoto(ph)} className="text-left">
+                                <img src={ph.data} alt={`${photoLabel} ${i === 0 ? 'first' : 'latest'}`} className="w-full aspect-[3/4] object-cover rounded-lg" />
+                                <span className="text-xs text-slate-500">{i === 0 ? 'First' : 'Latest'}: {fmt(ph.iso)}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <div className="grid grid-cols-3 gap-2">
+                        {shown.map(ph => (
+                          <button key={ph.id} onClick={() => setViewPhoto(ph)} className="text-left">
+                            <img src={ph.data} alt={`${ph.label} ${fmt(ph.iso)}`} className="w-full aspect-[3/4] object-cover rounded-lg" />
+                            <span className="text-xs text-slate-500">{fmt(ph.iso)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
               {/* HISTORY */}
               {checkIns.length > 0 && (
                 <div className="glass-card p-5 rounded-2xl space-y-2">
@@ -1152,7 +1520,7 @@
                   {workoutLogs.map((log) => (
                     <div key={log.id} className="glass-card p-4 rounded-xl space-y-2 border-l-4 border-blue-500">
                       <div className="flex justify-between items-center text-xs">
-                        <span className="font-bold text-white text-sm">{log.name}</span>
+                        <span className="font-bold text-white text-sm">{log.name}{log.deload ? ' (deload)' : ''}</span>
                         <span className="text-slate-400">{log.date}</span>
                       </div>
                       <div className="flex gap-4 text-xs text-slate-400 font-mono">
